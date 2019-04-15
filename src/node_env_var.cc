@@ -1,6 +1,7 @@
 #include "node_errors.h"
 #include "node_process.h"
 #include "util.h"
+#include "uv.h"
 
 #ifdef __APPLE__
 #include <crt_externs.h>
@@ -66,89 +67,65 @@ std::shared_ptr<KVStore> system_environment = std::make_shared<RealEnvStore>();
 Local<String> RealEnvStore::Get(Isolate* isolate,
                                 Local<String> property) const {
   Mutex::ScopedLock lock(per_process::env_var_mutex);
-#ifdef __POSIX__
+
   node::Utf8Value key(isolate, property);
-  const char* val = getenv(*key);
-  if (val) {
-    return String::NewFromUtf8(isolate, val, NewStringType::kNormal)
-        .ToLocalChecked();
-  }
-#else  // _WIN32
-  node::TwoByteValue key(isolate, property);
-  WCHAR buffer[32767];  // The maximum size allowed for environment variables.
-  SetLastError(ERROR_SUCCESS);
-  DWORD result = GetEnvironmentVariableW(
-      reinterpret_cast<WCHAR*>(*key), buffer, arraysize(buffer));
-  // If result >= sizeof buffer the buffer was too small. That should never
-  // happen. If result == 0 and result != ERROR_SUCCESS the variable was not
-  // found.
-  if ((result > 0 || GetLastError() == ERROR_SUCCESS) &&
-      result < arraysize(buffer)) {
-    const uint16_t* two_byte_buffer = reinterpret_cast<const uint16_t*>(buffer);
-    v8::MaybeLocal<String> rc = String::NewFromTwoByte(
-        isolate, two_byte_buffer, NewStringType::kNormal);
-    if (rc.IsEmpty()) {
-      isolate->ThrowException(ERR_STRING_TOO_LONG(isolate));
+
+  char* val = nullptr;
+  size_t initSz = 256;
+
+  // initially allocate 256 bytes, if not enough reallocate
+  val = Malloc(sizeof(char) * initSz);
+
+  int ret = uv_os_getenv(*key, val, &initSz);
+
+  if (UV_ENOBUFS == ret) {
+    // buffer is not long enough, reallocate to the updated initSz
+    // and fetch env value again
+
+    val = (char*)Realloc(val, sizeof(char) * initSz);
+
+    ret = uv_os_getenv(*key, val, &initSz);
+
+    // still failed to fetch env value return emptry string
+    if (UV_ENOBUFS == ret || UV_ENOENT == ret) {
       return Local<String>();
     }
-    return rc.ToLocalChecked();
   }
-#endif
-  return Local<String>();
+  Local<String> valueString =
+      String::NewFromUtf8(isolate, val, NewStringType::kNormal)
+          .ToLocalChecked();
+
+  if (val) free(val);
+
+  return valueString;
 }
 
 void RealEnvStore::Set(Isolate* isolate,
                        Local<String> property,
                        Local<String> value) {
   Mutex::ScopedLock lock(per_process::env_var_mutex);
-#ifdef __POSIX__
+
   node::Utf8Value key(isolate, property);
   node::Utf8Value val(isolate, value);
-  setenv(*key, *val, 1);
-#else  // _WIN32
-  node::TwoByteValue key(isolate, property);
-  node::TwoByteValue val(isolate, value);
-  WCHAR* key_ptr = reinterpret_cast<WCHAR*>(*key);
-  // Environment variables that start with '=' are read-only.
-  if (key_ptr[0] != L'=') {
-    SetEnvironmentVariableW(key_ptr, reinterpret_cast<WCHAR*>(*val));
-  }
-#endif
+  uv_os_setenv(*key, *val);
+
 }
 
 int32_t RealEnvStore::Query(Isolate* isolate, Local<String> property) const {
   Mutex::ScopedLock lock(per_process::env_var_mutex);
-#ifdef __POSIX__
-  node::Utf8Value key(isolate, property);
-  if (getenv(*key)) return 0;
-#else  // _WIN32
-  node::TwoByteValue key(isolate, property);
-  WCHAR* key_ptr = reinterpret_cast<WCHAR*>(*key);
-  SetLastError(ERROR_SUCCESS);
-  if (GetEnvironmentVariableW(key_ptr, nullptr, 0) > 0 ||
-      GetLastError() == ERROR_SUCCESS) {
-    if (key_ptr[0] == L'=') {
-      // Environment variables that start with '=' are hidden and read-only.
-      return static_cast<int32_t>(v8::ReadOnly) |
-             static_cast<int32_t>(v8::DontDelete) |
-             static_cast<int32_t>(v8::DontEnum);
-    }
+
+  if (!this->Get(isolate, property).IsEmpty()) {
     return 0;
   }
-#endif
+
   return -1;
 }
 
 void RealEnvStore::Delete(Isolate* isolate, Local<String> property) {
   Mutex::ScopedLock lock(per_process::env_var_mutex);
-#ifdef __POSIX__
+
   node::Utf8Value key(isolate, property);
-  unsetenv(*key);
-#else
-  node::TwoByteValue key(isolate, property);
-  WCHAR* key_ptr = reinterpret_cast<WCHAR*>(*key);
-  SetEnvironmentVariableW(key_ptr, nullptr);
-#endif
+  uv_os_unsetenv(*key);
 }
 
 Local<Array> RealEnvStore::Enumerate(Isolate* isolate) const {
